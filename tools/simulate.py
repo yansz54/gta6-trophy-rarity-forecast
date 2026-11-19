@@ -1,321 +1,299 @@
-"""Monte Carlo validation for the trophy-rarity forecaster.
+"""Monte Carlo validation for the GTA VI trophy rarity forecaster.
 
-Builds synthetic worlds that obey the same physics the forecaster assumes
-— tracked players grow and dilute the rates, earned counts only grow as
-players work through the story, Exophase refreshes the page every few
-hours — but with TRUE parameters drawn independently of the forecaster's
-priors, so the comparison is honest.  Then it runs the forecaster and both
-house baselines on each synthetic case and compares mean pinball loss.
+Builds synthetic worlds with true parameters drawn independently of the
+forecaster's priors (eventual shares +/-35%, play-hours +/-40%, play-rate
+median and story speed drawn per world, tracked population saturating
+between 250k and 1.5M), the same refresh-and-read cadence as the house
+(refreshes Poisson, mean 5 h; reads every 30 min, then every 10 min),
+and scores the forecaster against the two house baselines with the
+house's own pinball loss (tools/score.py).
 
-World, per seed:
-  * Tracked players N(t) follow a saturating hyperbola, anchored to the two
-    facts the house actually observed: 638 tracked at launch night, 3,868
-    by the 04:30Z refresh.  N_inf (the eventual tracked population) is
-    drawn log-uniform between 250k and 1.5M.
-  * A small reviewer cohort (10 players, joined 2-10 days early, playing
-    ~8 h/day) reproduces the launch-night counts: a few chapter completions
-    and a few platinums among the first 638.
-  * Each trophy's true (a, tau, sigma) is drawn around the forecaster's
-    prior with lognormal noise (sigma 0.35 on a, 0.4 on tau), the true
-    play-rate median is drawn around 2.2 h/day, and a story-speed factor
-    shifts all story taus together — so the world is sometimes faster and
-    sometimes slower than the prior expects.
-  * Refreshes are a Poisson process (mean interval --refresh hours, default
-    5), with the first refresh after release forced into 04:00-05:00Z to
-    match the observed one.  Reads (every 30 min, then every 10 min) show
-    the last refresh's values, rates rounded to 2 decimals, exactly like
-    the house's cases.
-  * The answer is the first read at or after the target.
+Final-style cases use 2 days of history and a 4.5-day horizon;
+practice-style cases use a 90-minute horizon. The forecaster should beat
+both baselines in (nearly) every world; on practice-style cases the win
+is in the mean, because the refresh is a coin flip there.
 
 Usage:
-    python3 tools/simulate.py [--seeds N] [--refresh H] [--practice-only]
-                              [--final-only] [--out DIR]
+    python3 tools/simulate.py [--worlds N] [--refresh-mean H] [--practice]
+Prints one row per refresh mean with the mean loss of each method and
+how many worlds the forecaster won.
 """
 
 import argparse
+import importlib.util
 import json
 import math
 import random
 import sys
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 
-sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
-import main as M
-from tools.score import mean_pinball, persistence_forecast, curve_forecast
+sys.path.insert(0, __file__.rsplit("/", 2)[0])
 
-EPOCH = datetime(1970, 1, 1, tzinfo=timezone.utc)
-RELEASE = datetime(2026, 11, 19, 0, 0, tzinfo=timezone.utc)
-KIT_CASE = Path.home() / "workspace" / "makefun" / \
-    "gta6-trophy-rarity-forecast-01-kit" / "gta6-trophy-rarity-forecast-01-kit" / \
-    "input" / "p00.in"
+from tools.score import pinball, logit  # noqa: E402
+
+LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
+Z = [-1.6448536269514722, -0.6744897501960817, 0.0,
+     0.6744897501960817, 1.6448536269514722]
+
+# The 55 trophies' kinds (from the practice case's trophy list, in id
+# order) and the forecaster's prior (a, tau) per kind, for drawing the
+# world's true parameters as perturbations of the priors.
+KINDS = ["platinum", "first", "story_ch1", "story_ch2", "story_ch3",
+         "story_ch4", "story_final"] + ["story_mission"] * 20 + \
+        ["side_strand"] * 6 + ["activity"] * 8 + ["grind"] * 3 + \
+        ["collectible"] * 3 + ["money"] * 3 + ["misc"] * 5 + \
+        ["completion", "platinum"]
+KINDS = KINDS[:55]
+PRIORS = {
+    "first": (0.999, 1.5), "story_ch1": (0.88, 18.0),
+    "story_ch2": (0.82, 28.0), "story_ch3": (0.74, 45.0),
+    "story_ch4": (0.66, 62.0), "story_final": (0.55, 75.0),
+    "story_mission": (0.80, 25.0), "side_strand": (0.35, 55.0),
+    "activity": (0.32, 40.0), "grind": (0.14, 110.0),
+    "collectible": (0.16, 110.0), "money": (0.30, 65.0),
+    "misc": (0.35, 40.0), "completion": (0.08, 220.0),
+    "platinum": (0.05, 260.0),
+}
 
 
-def iso(dt):
-    return dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+def load_forecaster():
+    spec = importlib.util.spec_from_file_location(
+        "rarity_main",
+        __file__.rsplit("/", 2)[0] + "/main.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
 
 
-def hours_since_release(dt):
-    return (dt - RELEASE).total_seconds() / 3600.0
+def norm_cdf(x):
+    return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
-def norm_cdf(z):
-    return 0.5 * (1.0 + math.erf(z / math.sqrt(2.0)))
+def make_world(rng, refresh_mean, final_style=True):
+    """Draw a synthetic world's true parameters."""
+    play_rate_med = rng.uniform(1.6, 3.0)
+    play_rate_sig = rng.uniform(0.6, 0.9)
+    n_sat = rng.uniform(250_000, 1_500_000)
+    # N(t): saturating (hyperbolic) growth from 638 at release.
+    n0 = 638.0
+    growth = rng.uniform(0.8, 1.6)  # shape of the saturation curve
+    trues = []
+    for kind in KINDS:
+        a0, tau0 = PRIORS[kind]
+        a = min(0.999, max(0.01, a0 * math.exp(rng.gauss(0, 0.35))))
+        tau = tau0 * math.exp(rng.gauss(0, 0.40))
+        trues.append((a, tau))
+    return {
+        "play_rate_med": play_rate_med, "play_rate_sig": play_rate_sig,
+        "n_sat": n_sat, "n0": n0, "growth": growth, "trues": trues,
+        "refresh_mean": refresh_mean,
+    }
 
 
-class World:
-    def __init__(self, rng, refresh_mean_h=5.0):
-        self.rng = rng
-        self.refresh_mean_h = refresh_mean_h
-        # Tracked-players growth: saturating hyperbola, anchored to the two
-        # observed facts (638 at launch night, 3,868 at the 04:30Z refresh).
-        n_inf = math.exp(rng.uniform(math.log(250000), math.log(1500000)))
-        anchor = 3868.0 * math.exp(rng.gauss(0.0, 0.10))
-        frac = (anchor - 638.0) / (n_inf - 638.0)
-        frac = min(0.9, max(1e-4, frac))
-        self.n_inf = n_inf
-        self.t_half = 4.5 * (1.0 / frac - 1.0)
-        self.n0 = 638.0
-        # True play-rate distribution (median hours/day).
-        self.rho_med = 2.2 * math.exp(rng.gauss(0.0, 0.25))
-        self.rho_points = [math.exp(0.75 * M.norm_ppf((i + 0.5) / 9.0) +
-                                    math.log(self.rho_med)) for i in range(9)]
-        # True trophy parameters, drawn around the forecaster's priors.
-        case = json.load(open(KIT_CASE))
-        self.trophies = case["trophies"]
-        story_speed = math.exp(rng.gauss(0.0, 0.20))
-        kinds = M.resolve_kinds(
-            self.trophies, [M.classify(tr, None) for tr in self.trophies])
-        self.true_params = []
-        for tr, kind in zip(self.trophies, kinds):
-            pr = M.TYPE_PRIORS[kind]
-            a = min(0.999, max(0.002, pr["a"] * math.exp(rng.gauss(0.0, 0.35))))
-            tau = pr["tau"] * math.exp(rng.gauss(0.0, 0.40))
-            if kind.startswith("story"):
-                tau *= story_speed
-            tau = min(600.0, max(0.5, tau))
-            s = min(0.8, max(0.3, pr["s"] * math.exp(rng.gauss(0.0, 0.15))))
-            self.true_params.append((a, tau, s))
-        # Reviewer cohort: 10 players, joined 2-10 days early, heavy play.
-        self.reviewers = [(rng.uniform(-240.0, -48.0),
-                           math.exp(rng.gauss(math.log(8.0), 0.4)))
-                          for _ in range(10)]
-        # Refresh schedule.
-        self.refreshes = self._refresh_schedule()
-        # Cache of page states, keyed by refresh time.
-        self._state_cache = {}
-        # Hourly join bins from -240h to +200h, and earn-curve rows.
-        self._build()
+def true_n(world, hours):
+    """Saturating tracked population at `hours` since release."""
+    n0, sat, g = world["n0"], world["n_sat"], world["growth"]
+    # Hyperbolic saturation: N = sat * h / (h + k), anchored at N(0)=n0
+    # via N(h) = n0 + (sat - n0) * (1 - exp(-g * h / 48)).
+    return n0 + (sat - n0) * (1.0 - math.exp(-g * hours / 48.0))
 
-    def n_true(self, t_h):
-        if t_h <= 0:
-            return self.n0
-        return self.n0 + (self.n_inf - self.n0) * t_h / (t_h + self.t_half)
 
-    def _refresh_schedule(self):
-        rng = self.rng
-        times = [-0.2]
-        times.append(rng.uniform(4.0, 5.0))
-        t = times[-1]
-        while t < 200.0:
-            t += rng.expovariate(1.0 / self.refresh_mean_h)
-            times.append(t)
-        return times
+def true_earn_cdf(age_days, tau, world):
+    """True earn curve for a trophy needing tau play-hours."""
+    sigma = math.sqrt(0.5 ** 2 + world["play_rate_sig"] ** 2)
+    mu = math.log(tau / world["play_rate_med"])
+    if age_days <= 0:
+        return 0.0
+    return norm_cdf((math.log(age_days) - mu) / sigma)
 
-    def _earn_row(self, a, tau, s, max_age_h):
-        row = []
-        log_tau = math.log(tau)
-        for age_h in range(max_age_h + 1):
-            if age_h <= 0:
-                row.append(0.0)
-                continue
-            age_d = age_h / 24.0
-            total = 0.0
-            for rho in self.rho_points:
-                play = rho * age_d
-                total += norm_cdf((math.log(play) - log_tau) / s) if play > 0 else 0.0
-            row.append(a * total / len(self.rho_points))
-        return row
 
-    def _build(self):
-        # Hourly bins: index 0 = hour starting at -240h.
-        self.t_start = -240.0
-        self.n_bins = 440  # -240h .. +200h
-        joins = []
-        for b in range(self.n_bins):
-            t0 = self.t_start + b
-            t1 = t0 + 1.0
-            if t1 <= 0:
-                joins.append(0.0)
-            else:
-                joins.append(max(0.0, self.n_true(t1) - self.n_true(max(0.0, t0))))
-        # Reviewers join in their own bins.
-        for jt, _rho in self.reviewers:
-            b = int(math.floor(jt - self.t_start))
-            if 0 <= b < self.n_bins:
-                joins[b] += 1.0
-        # The rest of the launch-night cohort (638 - 10 reviewers): players
-        # who had the game before release, spread over the 72 hours before
-        # it.  Without them the launch-night rates are ~0 for every trophy
-        # (the real page showed Gone Fishing at 100% and chapter 1 at
-        # 1.25% among the first 638).
-        initial = self.n0 - len(self.reviewers)
-        for b in range(168, 240):
-            joins[b] += initial / 72.0
-        self.joins = joins
-        # Earn rows per trophy, indexed by age in hours.  Reviewers play
-        # faster than the median, so their earn curve uses their own rho:
-        # approximate by evaluating the row with a per-trophy rho scale is
-        # overkill; the reviewer counts are tiny, so use the same row and
-        # let their early join time do the work (they have had days to play).
-        self.rows = [self._earn_row(a, tau, s, 440)
-                     for (a, tau, s) in self.true_params]
+def true_counts(world, hours, trophy_idx):
+    """True earned count for one trophy at `hours` since release.
+    Cohort (reviewers, started 6 h before release) + joiners."""
+    a, tau = world["trues"][trophy_idx]
+    n = true_n(world, hours)
+    # Cohort: reviewers present at release; they started 6 h early.
+    cohort_n = world["n0"]
+    age_cohort = (hours + 6.0) / 24.0
+    c_cohort = a * cohort_n * true_earn_cdf(age_cohort, tau, world)
+    # Joiners: integrate the join rate against the earn curve.
+    steps = max(1, int(hours * 4))
+    dh = hours / steps if hours > 0 else 0.0
+    total = 0.0
+    for i in range(steps + 1):
+        h = i * dh
+        # Join rate by finite difference of N.
+        n1 = true_n(world, h)
+        n2 = true_n(world, min(hours, h + dh))
+        jr = (n2 - n1) / dh if dh > 0 else 0.0
+        age = max(0.0, (hours - h) / 24.0)
+        w = 0.5 if i in (0, steps) else 1.0
+        total += w * jr * true_earn_cdf(age, tau, world)
+    c_join = total * dh if hours > 0 else 0.0
+    return c_cohort + c_join
 
-    def state_at(self, t_h):
-        """True (N, [rates]) at hour t_h (float, hours since release)."""
-        n = self.n_true(t_h)
+
+def build_case(world, rng, final_style=True):
+    """Simulate one case: history reads + target, with the house cadence.
+    Returns (case_dict, answer_rates) where answer_rates is the true rate
+    per trophy at the target."""
+    release = datetime(2026, 11, 19, 0, 0, tzinfo=timezone.utc)
+    if final_style:
+        hist_hours, horizon_hours = 48.0, 108.0  # 2 days, 4.5 days
+    else:
+        hist_hours, horizon_hours = 3.0, 1.5
+    # Refresh times: Poisson with the world's refresh mean, from release.
+    refresh_at = []
+    t = 0.0
+    while t < hist_hours + horizon_hours:
+        t += rng.expovariate(1.0 / world["refresh_mean"])
+        if t < hist_hours + horizon_hours:
+            refresh_at.append(t)
+    # Read slots: every 30 min (then every 10 min in the final stretch).
+    reads = []
+    slot = 0.0
+    # The page a read shows is the last refresh at or before its slot.
+    def page_at(h):
+        # Last refresh at or before h; if none, the release page (n0).
+        past = [r for r in refresh_at if r <= h]
+        rt = past[-1] if past else 0.0
+        n = true_n(world, rt)
         rates = []
-        # Bin index of hour t_h: bins are hourly from t_start.
-        upto = int(math.floor(t_h - self.t_start))
-        for i in range(len(self.trophies)):
-            row = self.rows[i]
-            total = 0.0
-            for b in range(min(upto + 1, self.n_bins)):
-                age = int(t_h - (self.t_start + b))
-                if 0 <= age < len(row):
-                    total += self.joins[b] * row[age]
-            rates.append(100.0 * total / n if n > 0 else 0.0)
+        for idx in range(55):
+            c = true_counts(world, rt, idx)
+            rates.append(round(100.0 * c / n, 2) if n > 0 else 0.0)
         return n, rates
-
-    def snapshot(self, t_h):
-        """Page values at hour t_h: last refresh at or before t_h."""
-        last = None
-        for rt in self.refreshes:
-            if rt <= t_h:
-                last = rt
-            else:
-                break
-        if last is None:
-            last = self.refreshes[0]
-        if last not in self._state_cache:
-            n, rates = self.state_at(last)
-            self._state_cache[last] = (int(round(n)),
-                                       [round(r, 2) for r in rates])
-        return self._state_cache[last]
-
-    def make_case(self, checkpoint_dt, target_dt, case_id):
-        horizon_min = int((target_dt - checkpoint_dt).total_seconds() // 60)
-        # Read cadence: every 30 min from 23:50Z 18 Nov; every 10 min from
-        # 06:00Z 19 Nov onward.
-        reads = []
-        t = datetime(2026, 11, 18, 23, 50, tzinfo=timezone.utc)
-        while t <= checkpoint_dt:
-            step = 30 if t < datetime(2026, 11, 19, 6, 0, tzinfo=timezone.utc) else 10
-            reads.append(self._read(t))
-            t += timedelta(minutes=step)
-        # Answer: first read at or after the target.
-        t = checkpoint_dt
-        while True:
-            step = 10
-            r = self._read(t)
-            if t >= target_dt:
-                answer = r
-                break
-            t += timedelta(minutes=step)
-        case = {
-            "id": case_id,
-            "game": {"name": "Grand Theft Auto VI", "platform": "PS5",
-                     "release_date": "2026-11-19"},
-            "at": iso(checkpoint_dt),
-            "target": iso(target_dt),
-            "horizon_minutes": horizon_min,
-            "levels": [0.05, 0.25, 0.5, 0.75, 0.95],
-            "trophies": self.trophies,
-            "history": reads,
-        }
-        return case, answer["rates"]
-
-    def _read(self, dt):
-        t_h = hours_since_release(dt)
-        n, rates = self.snapshot(t_h)
-        return {"slot": iso(dt), "at": iso(dt + timedelta(milliseconds=300)),
-                "players_tracked": n,
-                "trophies_earned": int(round(sum(r * n / 100.0 for r in rates))),
-                "rates": rates}
+    while slot < hist_hours:
+        n, rates = page_at(slot)
+        reads.append({
+            "slot": (release + timedelta(hours=slot)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "at": (release + timedelta(hours=slot)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+            "players_tracked": int(round(n)),
+            "trophies_earned": [None] * 55,
+            "rates": rates,
+        })
+        slot += 0.5
+    # The answer: the true rates at the target.
+    target_h = hist_hours + horizon_hours
+    n_ans = true_n(world, target_h)
+    ans = []
+    for idx in range(55):
+        c = true_counts(world, target_h, idx)
+        ans.append(100.0 * c / n_ans if n_ans > 0 else 0.0)
+    trophies = []
+    for i, kind in enumerate(KINDS):
+        trophies.append({"id": i + 1, "name": f"Trophy {i + 1}",
+                         "description": "", "tier": "bronze",
+                         "points": 15, "secret": False})
+    trophies[0]["tier"] = "platinum"
+    trophies[0]["points"] = 300
+    case = {
+        "schema": "makefun/gta6-trophies-case/v1", "id": "sim",
+        "at": (release + timedelta(hours=hist_hours)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "horizon_minutes": int(horizon_hours * 60),
+        "target": (release + timedelta(hours=target_h)).strftime("%Y-%m-%dT%H:%M:%SZ"),
+        "levels": LEVELS,
+        "game": {"name": "Grand Theft Auto VI", "platform": "PS5",
+                 "release_date": "2026-11-19",
+                 "source": "https://www.exophase.com/game/grand-theft-auto-vi-psn/trophies/"},
+        "trophies": trophies, "history": reads, "notes": "synthetic world",
+    }
+    return case, ans
 
 
-def run(seed, refresh_mean_h, kinds, out_dir):
-    rng = random.Random(1000 + seed)
-    world = World(rng, refresh_mean_h)
-    results = {}
-    if "practice" in kinds:
-        ck = datetime(2026, 11, 19, 3, 0, tzinfo=timezone.utc)
-        tg = datetime(2026, 11, 19, 4, 30, tzinfo=timezone.utc)
-        case, answer = world.make_case(ck, tg, f"sim-practice-{seed}")
-        results["practice"] = evaluate(case, answer, seed, "practice", out_dir)
-    if "final" in kinds:
-        ck = datetime(2026, 11, 21, 11, 30, tzinfo=timezone.utc)
-        tg = datetime(2026, 11, 26, 0, 0, tzinfo=timezone.utc)
-        case, answer = world.make_case(ck, tg, f"sim-final-{seed}")
-        results["final"] = evaluate(case, answer, seed, "final", out_dir)
-    return results
+def baseline_persistence(case):
+    last = case["history"][-1]["rates"]
+    return {"trophies": [{"id": t["id"], "q": [round(r, 4)] * 5}
+                         for t, r in zip(case["trophies"], last)]}
 
 
-def evaluate(case, answer, seed, kind, out_dir):
-    import time
-    t0 = time.time()
-    fc = M.forecast_case(case, case["id"])
-    elapsed = time.time() - t0
-    loss, _ = mean_pinball(answer, fc["trophies"])
-    lp, _ = mean_pinball(answer, persistence_forecast(case)["trophies"])
-    lc, _ = mean_pinball(answer, curve_forecast(case)["trophies"])
-    if out_dir:
-        out_dir = Path(out_dir)
-        out_dir.mkdir(parents=True, exist_ok=True)
-        (out_dir / f"{case['id']}.in").write_text(json.dumps(case))
-        (out_dir / f"{case['id']}.out").write_text(json.dumps(fc))
-        (out_dir / f"{case['id']}.answer.json").write_text(
-            json.dumps({"rates": answer}))
-    print(f"  seed {seed} {kind}: mine {loss:.4f}  persistence {lp:.4f}  "
-          f"curve {lc:.4f}  ({elapsed:.1f}s)")
-    return {"mine": loss, "persistence": lp, "curve": lc}
+def baseline_fitted_curve(case):
+    """House curve baseline: straight line to each trophy's logit rate
+    against ln(1 + hours) over the last 24 h of reads, read at the target,
+    spread = random walk + residual."""
+    release = datetime(2026, 11, 19, 0, 0, tzinfo=timezone.utc)
+    horizon_days = case["horizon_minutes"] / 1440.0
+    rows = []
+    for idx, trophy in enumerate(case["trophies"]):
+        pts = []
+        for h in case["history"]:
+            t = datetime.strptime(h["at"], "%Y-%m-%dT%H:%M:%SZ").replace(tzinfo=timezone.utc)
+            hours = (t - release).total_seconds() / 3600.0
+            if hours < -24:
+                continue
+            r = h["rates"][idx]
+            if r is None:
+                continue
+            pts.append((math.log1p(max(0.0, hours)), logit(r)))
+        if len(pts) >= 3:
+            mx = sum(p[0] for p in pts) / len(pts)
+            my = sum(p[1] for p in pts) / len(pts)
+            sxx = sum((p[0] - mx) ** 2 for p in pts)
+            sxy = sum((p[0] - mx) * (p[1] - my) for p in pts)
+            slope = sxy / sxx if sxx > 0 else 0.0
+            inter = my - slope * mx
+            resid = math.sqrt(sum((p[1] - (inter + slope * p[0])) ** 2
+                                  for p in pts) / max(1, len(pts) - 2))
+            target_x = math.log1p(max(0.0, (datetime.strptime(
+                case["target"], "%Y-%m-%dT%H:%M:%SZ").replace(
+                    tzinfo=timezone.utc) - release).total_seconds() / 3600.0))
+            centre = inter + slope * target_x
+            spread = math.sqrt((0.5 * math.sqrt(horizon_days)) ** 2 + resid ** 2)
+        else:
+            last = case["history"][-1]["rates"][idx]
+            centre = logit(last if last is not None else 0.0)
+            spread = 0.5 * math.sqrt(horizon_days)
+        qs = []
+        for z in Z:
+            v = 100.0 / (1.0 + math.exp(-(centre + z * spread)))
+            qs.append(round(min(99.99, max(0.01, v)), 4))
+        rows.append({"id": trophy["id"], "q": qs})
+    return {"trophies": rows}
+
+
+def score_forecast(forecast, answer):
+    total, count = 0.0, 0
+    for row in forecast["trophies"]:
+        y = answer[row["id"] - 1]
+        for tau, q in zip(LEVELS, row["q"]):
+            total += pinball(y, q, tau)
+            count += 1
+    return total / count if count else float("nan")
 
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--seeds", type=int, default=12)
-    ap.add_argument("--refresh", type=float, default=5.0)
-    ap.add_argument("--practice-only", action="store_true")
-    ap.add_argument("--final-only", action="store_true")
-    ap.add_argument("--out", default="")
+    ap.add_argument("--worlds", type=int, default=8)
+    ap.add_argument("--refresh-mean", type=float, default=5.0)
+    ap.add_argument("--practice", action="store_true",
+                    help="practice-style cases (90-minute horizon)")
+    ap.add_argument("--seed", type=int, default=1234)
     args = ap.parse_args()
-    kinds = []
-    if not args.final_only:
-        kinds.append("practice")
-    if not args.practice_only:
-        kinds.append("final")
-    agg = {k: {"mine": [], "persistence": [], "curve": []} for k in kinds}
-    wins = {k: {"mine_vs_pers": 0, "mine_vs_curve": 0, "n": 0} for k in kinds}
-    for seed in range(args.seeds):
-        res = run(seed, args.refresh, kinds, args.out or None)
-        for k, r in res.items():
-            for m in ("mine", "persistence", "curve"):
-                agg[k][m].append(r[m])
-            wins[k]["n"] += 1
-            if r["mine"] < r["persistence"]:
-                wins[k]["mine_vs_pers"] += 1
-            if r["mine"] < r["curve"]:
-                wins[k]["mine_vs_curve"] += 1
-    print()
-    for k in kinds:
-        n = wins[k]["n"]
-        print(f"{k} ({n} worlds, refresh mean {args.refresh}h):")
-        for m in ("mine", "persistence", "curve"):
-            vals = agg[k][m]
-            print(f"  {m:12s} mean loss {sum(vals)/len(vals):.4f}  "
-                  f"range [{min(vals):.3f}, {max(vals):.3f}]")
-        print(f"  mine beats persistence {wins[k]['mine_vs_pers']}/{n}, "
-              f"beats curve {wins[k]['mine_vs_curve']}/{n}")
+    mod = load_forecaster()
+    rng = random.Random(args.seed)
+    final_style = not args.practice
+    losses = {"forecaster": [], "fitted-curve": [], "persistence": []}
+    wins = 0
+    for w in range(args.worlds):
+        world = make_world(rng, args.refresh_mean, final_style)
+        case, ans = build_case(world, rng, final_style)
+        fc = mod.forecast_case(case)
+        losses["forecaster"].append(score_forecast(fc, ans))
+        losses["fitted-curve"].append(
+            score_forecast(baseline_fitted_curve(case), ans))
+        losses["persistence"].append(
+            score_forecast(baseline_persistence(case), ans))
+        if losses["forecaster"][-1] < min(losses["fitted-curve"][-1],
+                                          losses["persistence"][-1]):
+            wins += 1
+    kind = "final-style" if final_style else "practice-style"
+    print(f"{kind} cases, refresh mean {args.refresh_mean} h, "
+          f"{args.worlds} worlds (seed {args.seed})")
+    for name in ("forecaster", "fitted-curve", "persistence"):
+        vals = losses[name]
+        print(f"  {name:13s} mean loss {sum(vals)/len(vals):.3f} "
+              f"(min {min(vals):.3f}, max {max(vals):.3f})")
+    print(f"  forecaster beat both baselines in {wins}/{args.worlds} worlds")
 
 
 if __name__ == "__main__":
