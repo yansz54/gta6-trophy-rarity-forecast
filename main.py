@@ -1,32 +1,36 @@
-"""GTA VI trophy rarity forecaster (count-based convolution model).
+#!/usr/bin/env python3
+"""GTA VI trophy rarity forecaster (v3) — make.fun gta6-trophy-rarity-forecast-01.
 
-Forecasts, for each of GTA VI's 55 PlayStation trophies, the percent of
-Exophase-tracked players who will hold it at the case target, as five
-quantiles (0.05, 0.25, 0.5, 0.75, 0.95). Scoring is mean pinball loss on
-the logit scale; a prize needs a loss strictly below the best house entry.
+Model (see METHOD.md for the full write-up, every seed and every draw):
+  rate(t) = 100 * earned(t) / tracked(t), the two sides modelled separately.
+  * tracked(t): saturating logistic in x = ln(1 + hours since release),
+    N(x) = Nsat / (1 + exp(-k (x - x0))); x0 anchored to the first distinct
+    read; (k, Nsat) fitted to distinct reads where the history has signal,
+    otherwise from priors (k ~ 1.0, Nsat ~ 750k).
+  * earned(t): a pre-release cohort plus a convolution of the join rate with
+    a per-trophy earn curve — a lognormal in hours actually played, averaged
+    over a lognormal play-rate distribution (median 2.5 h/day, sigma 0.75).
+    Each trophy's eventual share s and characteristic play-hours h are
+    fitted by grid search to its observed counts, with a prior penalty
+    pulling them to the kind prior table.
+  * refresh: Exophase refreshes on its own schedule (a renewal process, NOT
+    memoryless). The refresh interval is lognormal (mean 3.8 h, sigma_log
+    0.15); the chance of no refresh before the target is the survival
+    ratio S(staleness + horizon) / S(staleness). Every bootstrap draw
+    samples refresh times; a draw whose last refresh before the target is
+    none reports the stale last-observed rates, otherwise the post-refresh
+    (diluted) rates from the counts. So the median is the diluted rate
+    whenever a refresh is the likely outcome.
+  * spread: a bootstrap (120 draws) resampling growth, refresh timing and
+    each trophy's (s, h); the five quantiles are read off the simulated
+    rates, with a small logit floor spread added.
+  * saturated trophies (observed rate >= 99.9%, i.e. the opening mission):
+    forecast a tight band near 100% — the first mission is completed in
+    minutes and every tracked player has played it.
 
-Model (see METHOD.md for the full description):
-  rate(T) = 100 * C(T) / N(T), modelling the two sides of the ratio
-  separately instead of extrapolating the rate itself.
-  - N(t): log N fitted linearly in log(1 + hours since release) over the
-    case history's distinct reads (consecutive identical reads collapsed).
-    Capped at 2,000,000 tracked players.
-  - C(t): a pre-release cohort plus a convolution of the join rate with a
-    per-trophy earn curve F (a lognormal in hours actually played, averaged
-    over a lognormal distribution of play rates, median 2.2 h/day,
-    sigma 0.75).
-  - Each trophy's eventual share `a` and characteristic play-hours `tau`
-    come from a prior table keyed to its kind, then fitted to the trophy's
-    observed counts by a grid search with a prior penalty.
-  - Spread: a seeded parametric bootstrap (80 draws, fixed seed); the
-    N-growth parameters and each trophy's (a, tau) are resampled, the
-    forecast recomputed, and the five quantiles read off the simulated
-    logit rates, with a small floor spread added. A no-refresh branch is
-    mixed in: with probability exp(-horizon / 5h) the answer read shows
-    exactly the last observed rates.
-
-Standard library only; no network, no wall-clock reads. Deterministic:
-two runs on the same input are byte-identical.
+Standard library only, no network, no wall-clock reads. All randomness
+comes from random.Random with fixed integer seeds (see METHOD.md), so two
+runs on the same case are byte-identical.
 """
 
 import json
@@ -34,429 +38,584 @@ import math
 import os
 import random
 import sys
-from pathlib import Path
+from bisect import bisect_right
+from datetime import datetime, timezone
+from statistics import NormalDist
 
-sys.path.insert(0, str(Path(__file__).resolve().parent))
+_ND = NormalDist()
 
-INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
-OUTPUT_DIR = Path(os.environ.get("MAKEFUN_OUTPUT_DIR", "/output"))
+# ---------------------------------------------------------------- constants
+SEED = 20261119
+BOOTSTRAP_DRAWS = 120
 
-LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
-# Standard normal quantiles at the levels (kept for reference; the
-# forecast's quantiles come from the bootstrap, not from these).
-Z = [-1.6448536269514722, -0.6744897501960817, 0.0,
-     0.6744897501960817, 1.6448536269514722]
+PLAY_RATE_MEDIAN = 2.2      # hours of play per day, median (brief sec. 3)
+PLAY_RATE_SIGMA = 0.75      # lognormal sigma of the play-rate distribution
+EARN_SIGMA = 0.6
 
-BOOTSTRAP_DRAWS = 80
-BOOTSTRAP_SEED = 42
-N_CAP = 2_000_000
-# No-refresh branch: mean time between Exophase page refreshes.
-REFRESH_MEAN_HOURS = 5.0
-# Play-rate distribution: lognormal, median hours/day, sigma.
-PLAY_RATE_MEDIAN = 2.2
-PLAY_RATE_SIGMA = 0.75
-# Sigma of the lognormal in play-hours needed (around tau).
-EARN_SIGMA = 0.5
-# Small floor spread added to the simulated logit rates (logit units).
-FLOOR_SPREAD = 0.05
-# Tau grid: 15 multipliers on a log grid around the prior tau.
-TAU_GRID_N = 15
-TAU_GRID_HALF_LOG = 1.2
-# Prior penalty weight in the grid search (squared log-distance).
-PRIOR_PENALTY = 2.0
+REFRESH_MEAN_H = 3.8        # mean refresh interval, hours (lognormal)
+REFRESH_SIGMA = 0.15        # lognormal sigma of the refresh interval
 
+GROWTH_K_PRIOR = 1.0        # prior median of the logistic growth rate k
+GROWTH_K_SIGMA = 0.12
+NSAT_PRIOR = 750000.0       # prior median of the saturation level
+NSAT_SIGMA = 0.35
+GROWTH_K_FIT_SIGMA = 0.15   # resampling log-sigma of k around a fit
+NSAT_FIT_SIGMA = 0.25       # resampling log-sigma of Nsat around a fit
 
-# Prior table: kind -> (eventual share a, characteristic play-hours tau).
-PRIORS = {
-    "first": (0.999, 1.5),
-    "story_ch1": (0.88, 18.0),
-    "story_ch2": (0.82, 28.0),
-    "story_ch3": (0.74, 45.0),
-    "story_ch4": (0.66, 62.0),
-    "story_final": (0.55, 75.0),
-    "story_mission": (0.80, 25.0),
-    "side_strand": (0.35, 55.0),
-    "activity": (0.32, 40.0),
-    "grind": (0.14, 110.0),
+TROPHY_S_SIGMA = 0.18
+TROPHY_H_SIGMA = 0.22
+FIT_PRIOR_SIGMA = 0.6       # log-sigma of the (s, h) prior penalty in the fit
+
+FLOOR_SD = 0.06
+SATURATED_MIN_RATE = 99.9   # observed rate at/above this => saturated rule
+SATURATED_Q = [99.7, 99.9, 99.95, 99.99, 99.99]
+
+Z_TAU = [-1.6448536269514722, -0.6744897501960817, 0.0,
+         0.6744897501960817, 1.6448536269514722]
+
+# Prior table: trophy kind -> (eventual share, characteristic play-hours).
+# Fitted in v2 from GTA VI story data + GTA V mature rates + launch reads;
+# re-checked against the practice data (see METHOD.md). The opening
+# mission's hours were cut from 1.5 to 0.12: launch-night data shows new
+# joiners earn essentially only the opening mission in their first hours,
+# so its characteristic time must be minutes, not hours.
+PRIOR = {
+    "opening":    (0.999, 0.12),
+    "chapter1":   (0.88, 18.0),
+    "chapter2":   (0.82, 28.0),
+    "chapter3":   (0.74, 45.0),
+    "chapter4":   (0.66, 62.0),
+    "final":      (0.55, 75.0),
+    "story":      (0.80, 25.0),
+    "strand":     (0.35, 55.0),
+    "oneoff":     (0.32, 40.0),
+    "grind":      (0.14, 110.0),
     "collectible": (0.16, 110.0),
-    "money": (0.30, 65.0),
-    "misc": (0.35, 40.0),
+    "money":      (0.30, 65.0),
+    "misc":       (0.35, 40.0),
     "completion": (0.08, 220.0),
-    "platinum": (0.05, 260.0),
+    "platinum":   (0.05, 260.0),
 }
 
-
-def clamp(x: float) -> float:
-    return min(99.99, max(0.01, x))
-
-
-def logit(pct: float) -> float:
-    p = clamp(pct) / 100.0
-    return math.log(p / (1.0 - p))
+# ---------------------------------------------------------------- utilities
+def parse_time(s):
+    """ISO 8601 UTC string -> aware datetime."""
+    return datetime.fromisoformat(s.replace("Z", "+00:00"))
 
 
-def inv_logit(x: float) -> float:
-    return 100.0 / (1.0 + math.exp(-x))
+def hours_between(a, b):
+    return (b - a).total_seconds() / 3600.0
 
 
-def round4(x: float):
-    """x rounded to 4 decimals, half up, as JavaScript's
-    Math.round(x * 10000) / 10000 rounds it."""
-    scaled = x * 10000
-    whole = math.floor(scaled)
-    if scaled - whole >= 0.5:
-        whole += 1
-    value = whole / 10000
-    return int(value) if value.is_integer() else value
-
-
-def parse_time(s: str) -> float:
-    """ISO 8601 UTC timestamp -> epoch seconds (float)."""
-    s = s.strip()
-    if s.endswith("Z"):
-        s = s[:-1] + "+00:00"
-    from datetime import datetime
-    return datetime.fromisoformat(s).timestamp()
-
-
-def norm_cdf(x: float) -> float:
+def norm_cdf(x):
     return 0.5 * (1.0 + math.erf(x / math.sqrt(2.0)))
 
 
-def classify_kind(trophy: dict) -> str:
-    """Classify a trophy into a prior kind from tier, name, description."""
-    tier = (trophy.get("tier") or "").lower()
-    name = trophy.get("name") or ""
-    desc = trophy.get("description") or ""
-    d = desc.lower()
-    n = name.lower()
-    if tier == "platinum":
-        return "platinum"
-    if "chapter 1" in d or "chapter 1" in n:
-        return "story_ch1"
-    if "chapter 2" in d or "chapter 2" in n:
-        return "story_ch2"
-    if "chapter 3" in d or "chapter 3" in n:
-        return "story_ch3"
-    if "chapter 4" in d or "chapter 4" in n:
-        return "story_ch4"
-    if "final mission" in d and "for " not in d:
-        return "story_final"
-    if "final mission for" in d:
-        return "side_strand"
-    if "gone fishing" in d:
-        return "first"
-    if "100%" in d or "100 percent" in d or "100%" in n:
-        return "completion"
-    # Counted repeats are grinds; collectible sets are collectibles.
-    if any(k in d for k in ("stunt", "challenge", "race", "win ", "defeat ",
-                            "knock out", "headshot")):
-        return "grind"
-    if any(k in d for k in ("collect", "card", "spot", "vehicle",
-                            "find all", "photograph")):
-        return "collectible"
-    if any(k in d for k in ("launder", "spend", "buy ", "money", "cash",
-                            "earn $", "$")):
-        return "money"
-    if any(k in d for k in ("bowling", "golf", "darts", "fish", "tackle",
-                            "bowl", "dance", "drink", "yoga", "meditat")):
-        return "activity"
-    if "stranger" in d or "strand" in d:
-        return "side_strand"
-    # A capitalised "Complete X." is a named story mission / heist.
-    if desc.startswith("Complete ") and desc.rstrip().endswith("."):
-        return "story_mission"
-    return "misc"
+def norm_ppf(p):
+    """Standard normal quantile (statistics.NormalDist, deterministic)."""
+    if p <= 0.0:
+        return -10.0
+    if p >= 1.0:
+        return 10.0
+    return _ND.inv_cdf(p)
 
 
-def distinct_reads(history):
-    """Collapse consecutive identical reads to one observation."""
-    out = []
-    prev = None
-    for h in history:
-        key = (h.get("players_tracked"), tuple(h.get("rates") or []))
-        if key != prev:
-            out.append(h)
-            prev = key
-    return out
-
-
-def fit_n(reads, release_epoch):
-    """Fit log N = alpha + beta * log(1 + hours since release) by least
-    squares over the distinct reads. Returns (alpha, beta, beta_sd,
-    n_distinct). With a single distinct read the slope is unidentified:
-    beta falls back to the prior mean with a wide width."""
-    xs = []
-    ys = []
-    for h in reads:
-        t = parse_time(h["at"])
-        hours = max(0.0, (t - release_epoch) / 3600.0)
-        xs.append(math.log1p(hours))
-        ys.append(math.log(max(1, h["players_tracked"])))
-    n = len(xs)
-    if n == 0:
-        return (math.log(638.0), 1.0, 0.5, 0)
-    if n == 1:
-        # Slope unidentified: keep the level, wide prior width on slope.
-        return (ys[0], 1.0, 0.5, 1)
-    mx = sum(xs) / n
-    my = sum(ys) / n
-    sxx = sum((x - mx) ** 2 for x in xs)
-    if sxx <= 1e-12:
-        return (my, 1.0, 0.5, n)
-    sxy = sum((x - mx) * (y - my) for x, y in zip(xs, ys))
-    beta = sxy / sxx
-    alpha = my - beta * mx
-    # Residual standard error for the slope.
-    resid = [y - (alpha + beta * x) for x, y in zip(xs, ys)]
-    dof = max(1, n - 2)
-    s2 = sum(r * r for r in resid) / dof
-    beta_se = math.sqrt(max(s2, 1e-6) / sxx) if sxx > 0 else 0.7
-    beta_sd = max(beta_se, 0.15)
-    return (alpha, beta, beta_sd, n)
-
-
-def n_at(alpha, beta, hours):
-    """Tracked players at `hours` since release (capped)."""
-    val = math.exp(alpha + beta * math.log1p(max(0.0, hours)))
-    return min(val, N_CAP)
-
-
-def join_rate(alpha, beta, hours):
-    """dN/dh at `hours` since release (players per hour)."""
-    if beta <= 0:
+def lognorm_cdf(x, mean, sigma):
+    """CDF of a lognormal with the given mean and log-sigma."""
+    if x <= 0.0:
         return 0.0
-    return n_at(alpha, beta, hours) * beta / (1.0 + max(0.0, hours))
+    mu = math.log(mean) - 0.5 * sigma * sigma
+    return norm_cdf((math.log(x) - mu) / sigma)
 
 
-def earn_cdf(age_days, tau):
-    """F(age): share of joiners who have earned by real-time age (days),
-    for a trophy needing tau play-hours. The play-hours needed are
-    lognormal around tau (sigma EARN_SIGMA); the play rate is lognormal
-    (median PLAY_RATE_MEDIAN h/day, sigma PLAY_RATE_SIGMA). The ratio is
-    lognormal, so the earn time in days is lognormal with
-    mu = ln(tau / PLAY_RATE_MEDIAN), sigma = sqrt(EARN_SIGMA^2 +
-    PLAY_RATE_SIGMA^2)."""
-    if age_days <= 0:
+def lognorm_sf(x, mean, sigma):
+    return 1.0 - lognorm_cdf(x, mean, sigma)
+
+
+def lognorm_ppf(p, mean, sigma):
+    """Quantile of a lognormal with the given mean and log-sigma."""
+    mu = math.log(mean) - 0.5 * sigma * sigma
+    return math.exp(mu + sigma * norm_ppf(p))
+
+
+def logit(p):
+    p = min(max(p, 0.0001), 0.9999)
+    return math.log(p / (1.0 - p))
+
+
+def inv_logit(x):
+    if x >= 0:
+        return 1.0 / (1.0 + math.exp(-x))
+    e = math.exp(x)
+    return e / (1.0 + e)
+
+
+def clamp_rate(r):
+    return min(max(r, 0.01), 99.99)
+
+
+# ------------------------------------------------- earn curve (g grid)
+# g(age_hours, h) = average earn probability for a player of wall-clock
+# age `age_hours`, whose characteristic play-hours are h: the lognormal
+# earn curve in play-hours, averaged over the play-rate distribution.
+# Precomputed on a (log age x log h) grid with a fixed 9-point quadrature
+# over play-rates; bilinear interpolation in (ln age, ln h).
+
+def _build_g_grid():
+    ages = []
+    a = 0.05
+    while a <= 5000.0:
+        ages.append(a)
+        a *= 1.16
+    hs = []
+    h = 0.1
+    while h <= 500.0:
+        hs.append(h)
+        h *= 1.22
+    # 9-point play-rate quadrature: quantiles (i+0.5)/9 of the lognormal.
+    rates = []
+    for i in range(9):
+        z = norm_ppf((i + 0.5) / 9.0)
+        rates.append(math.exp(math.log(PLAY_RATE_MEDIAN) + PLAY_RATE_SIGMA * z))
+    grid = []
+    for age in ages:
+        row = []
+        for h in hs:
+            tot = 0.0
+            for r in rates:
+                play_h = r * age / 24.0
+                if play_h <= 0.0:
+                    continue
+                tot += norm_cdf((math.log(play_h) - math.log(h)) / EARN_SIGMA)
+            row.append(tot / len(rates))
+        grid.append(row)
+    return ages, hs, grid
+
+
+AGES, HS, GGRID = _build_g_grid()
+LOG_AGES = [math.log(a) for a in AGES]
+LOG_HS = [math.log(h) for h in HS]
+
+
+def g_interp(age, h):
+    """Bilinear interpolation of g on the (ln age, ln h) grid."""
+    if age <= 0.0:
         return 0.0
-    sigma = math.sqrt(EARN_SIGMA ** 2 + PLAY_RATE_SIGMA ** 2)
-    mu = math.log(tau / PLAY_RATE_MEDIAN)
-    return norm_cdf((math.log(age_days) - mu) / sigma)
+    if age >= AGES[-1]:
+        age = AGES[-1]
+    if h <= HS[0]:
+        h = HS[0]
+    if h >= HS[-1]:
+        h = HS[-1]
+    la, lh = math.log(age), math.log(h)
+    ia = bisect_right(LOG_AGES, la) - 1
+    if ia < 0:
+        ia = 0
+    elif ia > len(LOG_AGES) - 2:
+        ia = len(LOG_AGES) - 2
+    ih = bisect_right(LOG_HS, lh) - 1
+    if ih < 0:
+        ih = 0
+    elif ih > len(LOG_HS) - 2:
+        ih = len(LOG_HS) - 2
+    a0, a1 = LOG_AGES[ia], LOG_AGES[ia + 1]
+    h0, h1 = LOG_HS[ih], LOG_HS[ih + 1]
+    fa = 0.0 if a1 == a0 else (la - a0) / (a1 - a0)
+    fh = 0.0 if h1 == h0 else (lh - h0) / (h1 - h0)
+    g00 = GGRID[ia][ih]
+    g01 = GGRID[ia][ih + 1]
+    g10 = GGRID[ia + 1][ih]
+    g11 = GGRID[ia + 1][ih + 1]
+    return (g00 * (1 - fa) * (1 - fh) + g01 * (1 - fa) * fh
+            + g10 * fa * (1 - fh) + g11 * fa * fh)
 
 
-def cohort_age_for_share(share, tau):
-    """The age (days) at which the earn curve reaches `share` (0..1).
-    Inverts earn_cdf by bisection. Returns None if share is out of range."""
-    if share <= 0.0:
+def invert_g(target, h):
+    """Wall-clock age at which g(age, h) == target (bisection; target in [0,1])."""
+    if target <= 0.0:
         return 0.0
-    if share >= 1.0:
-        return 1e6
-    sigma = math.sqrt(EARN_SIGMA ** 2 + PLAY_RATE_SIGMA ** 2)
-    mu = math.log(tau / PLAY_RATE_MEDIAN)
-    # Invert the normal CDF via the error function inverse approximation.
-    # Use a bisection on age in days.
-    lo, hi = 1e-9, 1e4
-    for _ in range(200):
-        mid = math.sqrt(lo * hi)
-        if earn_cdf(mid, tau) < share:
+    if target >= 1.0:
+        return AGES[-1]
+    lo, hi = 0.0, AGES[-1]
+    if g_interp(hi, h) < target:
+        return hi
+    for _ in range(30):
+        mid = 0.5 * (lo + hi)
+        if g_interp(mid, h) < target:
             lo = mid
         else:
             hi = mid
-    return math.sqrt(lo * hi)
+    return 0.5 * (lo + hi)
 
 
-def predict_count(trophy_idx, case, reads, alpha, beta, a, tau,
-                  release_epoch, target_epoch):
-    """Predicted earned count for one trophy at the target time."""
-    trophies = case["trophies"]
-    first = reads[0]
-    t0 = parse_time(first["at"])
-    n0 = first["players_tracked"]
-    # Observed earned count at the first read.
-    rates0 = first["rates"]
-    r0 = rates0[trophy_idx] if rates0 and rates0[trophy_idx] is not None else 0.0
-    c_obs = r0 / 100.0 * n0
-    # Cohort: effective age at t0 chosen so the cohort's count matches
-    # the observed count at t0.
-    eventual = a * n0
-    if eventual <= 0:
-        return 0.0
-    share0 = min(0.999999, max(0.0, c_obs / eventual))
-    age0 = cohort_age_for_share(share0, tau)
-    age_t = age0 + max(0.0, (target_epoch - t0) / 86400.0)
-    c_cohort = eventual * earn_cdf(age_t, tau)
-    # Joiners: convolution of the join rate with the earn curve.
-    # Integrate from t0 to target in hourly steps (trapezoid rule).
-    c_join = 0.0
-    h0 = max(0.0, (t0 - release_epoch) / 3600.0)
-    h1 = max(0.0, (target_epoch - release_epoch) / 3600.0)
-    if h1 > h0:
-        steps = max(1, int(math.ceil((h1 - h0) * 4)))  # 15-minute steps
-        dh = (h1 - h0) / steps
-        total = 0.0
-        for i in range(steps + 1):
-            h = h0 + i * dh
-            # Age of joiners from s=h at the target, in days.
-            age = max(0.0, (h1 - h) / 24.0)
-            f = earn_cdf(age, tau)
-            w = 0.5 if i in (0, steps) else 1.0
-            total += w * join_rate(alpha, beta, h) * f
-        c_join = total * dh
-    return c_cohort + c_join
+# ------------------------------------------------------- trophy kinds
+def classify(trophy):
+    name = (trophy.get("name") or "").lower()
+    desc = (trophy.get("description") or "").lower()
+    tier = trophy.get("tier") or ""
+    if tier == "platinum":
+        return "platinum"
+    if "gone fishing" in desc:
+        return "opening"
+    if "complete chapter 1" in desc:
+        return "chapter1"
+    if "complete chapter 2" in desc:
+        return "chapter2"
+    if "complete chapter 3" in desc:
+        return "chapter3"
+    if "complete chapter 4" in desc:
+        return "chapter4"
+    if desc.strip() == "complete the final mission.":
+        return "final"
+    if "complete the final mission for" in desc:
+        return "strand"
+    if "attain 100% completion" in desc:
+        return "completion"
+    if "mission strands" in desc:
+        return "strand"
+    if "earn $" in desc or "spend $" in desc:
+        return "money"
+    # Counted repeats (grinds): "complete/win/rob/discover N ..." with N >= 5.
+    import re
+    m = re.search(r"\b(complete|win|rob|discover|register|waank it)\s+(\d+)\b", desc)
+    if m and int(m.group(2)) >= 5:
+        return "grind"
+    # Set completion (collectibles): "all", "every", "each", "sets".
+    if ("all " in desc or "every " in desc or "each " in desc
+            or "sets" in desc or "set." in desc):
+        return "collectible"
+    # A capitalised "Complete <Name>." is a named story mission.
+    if desc.startswith("complete ") and desc.rstrip(".")[9:10].isupper():
+        return "story"
+    # Specific one-off feats.
+    if (desc.startswith(("try ", "beat ", "win ", "rob ", "complete ",
+                         "enjoy ", "smash ", "follow-through", "bowl ",
+                         "meditate ", "hunt ", "lose ", "take down ",
+                         "make ", "discover ", "explore ", "attain "))
+            or "kinda hot" in desc):
+        return "oneoff"
+    return "misc"
 
 
-def fit_trophy(trophy_idx, case, reads, alpha, beta, release_epoch):
-    """Fit (a, tau) for one trophy by grid search with a prior penalty.
-    Returns (a, tau). The predicted count is linear in a, so a is solved
-    exactly for each tau on the grid; tau is searched on a 15-point log
-    grid around the prior tau."""
-    kind = classify_kind(case["trophies"][trophy_idx])
-    a0, tau0 = PRIORS[kind]
-    # Observed counts at each distinct read.
-    obs = []
-    for h in reads:
-        rates = h.get("rates") or []
-        r = rates[trophy_idx] if trophy_idx < len(rates) and rates[trophy_idx] is not None else 0.0
-        obs.append((parse_time(h["at"]), r / 100.0 * h["players_tracked"]))
-    if not obs:
-        return (a0, tau0)
+# ------------------------------------------------------- growth curve
+def growth_x(t_rel_h):
+    """x = ln(1 + hours since release)."""
+    return math.log(max(1.0 + t_rel_h, 1e-6))
+
+
+def growth_n(x, k, nsat, x0):
+    return nsat / (1.0 + math.exp(-k * (x - x0)))
+
+
+def anchor_x0(x_first, n_first, k, nsat):
+    """x0 so that the curve passes through (x_first, n_first)."""
+    ratio = nsat / max(n_first, 1.0) - 1.0
+    if ratio <= 0.0:
+        ratio = 1e-9
+    return x_first + math.log(ratio) / k
+
+
+def fit_growth(distinct, release_dt):
+    """Return (k, nsat, x0, mode). Fits (k, nsat) to distinct reads when the
+    history has signal (>= 2 distinct reads with different N); otherwise
+    the prior medians. x0 is always anchored to the first distinct read."""
+    t_first, n_first = distinct[0][0], distinct[0][1]
+    x_first = growth_x(hours_between(release_dt, t_first))
+    varied = len({d[1] for d in distinct}) > 1 and len(distinct) >= 2
+    if not varied:
+        k, nsat = GROWTH_K_PRIOR, NSAT_PRIOR
+        return k, nsat, anchor_x0(x_first, n_first, k, nsat), "prior"
+    ks = [math.exp(math.log(0.4) + i * (math.log(2.5) - math.log(0.4)) / 15.0)
+          for i in range(16)]
+    nsats = [math.exp(math.log(100000.0)
+                      + i * (math.log(3000000.0) - math.log(100000.0)) / 15.0)
+             for i in range(16)]
     best = None
-    # Tau grid: 15 multipliers, log-spaced, centred on the prior tau.
-    for k in range(TAU_GRID_N):
-        frac = (k / (TAU_GRID_N - 1.0)) * 2.0 - 1.0  # -1 .. +1
-        tau = tau0 * math.exp(frac * TAU_GRID_HALF_LOG)
-        # For this tau, the predicted count is linear in a:
-        # C(t) = a * g(t) where g(t) is the count per unit a. Solve a by
-        # least squares on the observed counts (with the cohort anchored
-        # to the first read, the shape is set by tau; the level by a).
-        # We compute g(t) = predict_count with a=1 (and cohort share
-        # capped), then a = sum(obs*g)/sum(g*g), penalised toward a0.
-        gs = []
-        for (t_i, c_i) in obs:
-            # Count per unit a at read time t_i (cohort + joiners).
-            g = _count_per_unit_a(trophy_idx, case, reads, alpha, beta,
-                                  tau, release_epoch, t_i)
-            gs.append(g)
-        num = sum(c * g for (_, c), g in zip(obs, gs))
-        den = sum(g * g for g in gs)
-        if den <= 0:
-            a_fit = a0
+    for k in ks:
+        for nsat in nsats:
+            if nsat <= max(d[1] for d in distinct):
+                continue
+            x0 = anchor_x0(x_first, n_first, k, nsat)
+            sse = 0.0
+            for (t, n, _e) in distinct:
+                x = growth_x(hours_between(release_dt, t))
+                pred = growth_n(x, k, nsat, x0)
+                sse += (math.log(max(pred, 1.0)) - math.log(max(n, 1.0))) ** 2
+            if best is None or sse < best[0]:
+                best = (sse, k, nsat, x0)
+    _sse, k, nsat, x0 = best
+    return k, nsat, x0, "fit"
+
+
+# ------------------------------------------------------- earned counts
+def make_bins(t_start, t_end, n_curve, max_bins=110):
+    """Time bins from t_start to t_end for the join convolution.
+    Returns [(t_mid, dN)] with at most max_bins bins; dN from the N curve."""
+    span_h = hours_between(t_start, t_end)
+    if span_h <= 0:
+        return []
+    nbin = int(min(max_bins, max(1, math.ceil(span_h))))
+    step = span_h / nbin
+    bins = []
+    prev_t = t_start
+    prev_n = n_curve(prev_t)
+    for i in range(1, nbin + 1):
+        t = t_start
+        # advance by step hours from t_start
+        from datetime import timedelta
+        t = t_start + timedelta(hours=step * i)
+        n = n_curve(t)
+        dn = max(n - prev_n, 0.0)
+        if dn > 0:
+            mid = t_start + timedelta(hours=step * (i - 0.5))
+            bins.append((mid, dn))
+        prev_t, prev_n = t, n
+    return bins
+
+
+def earned_at(t_eval, s, h, a0, t_first, n0, bins, n_curve):
+    """Predicted earned count at t_eval for one trophy.
+    a0 = effective wall-clock age of the pre-release cohort at t_first
+    (solved so the cohort reproduces the first observed count)."""
+    age0 = a0 + hours_between(t_first, t_eval)
+    e = n0 * s * g_interp(age0, h)
+    for (t_mid, dn) in bins:
+        age = hours_between(t_mid, t_eval)
+        if age <= 0:
+            continue
+        e += dn * s * g_interp(age, h)
+    return e
+
+
+def fit_trophy(trophy, distinct, release_dt, growth):
+    """Grid-search (s, h) for one trophy: match its observed earned counts
+    at the distinct reads, with a prior penalty to the kind prior.
+    Returns (s, h)."""
+    kind = classify(trophy)
+    s0, h0 = PRIOR[kind]
+    t_first, n0, rates0 = distinct[0]
+    idx = trophy["_idx"]
+    e0 = rates0[idx] / 100.0 * n0 if rates0[idx] is not None else 0.0
+    k, nsat, x0 = growth
+    n_curve = lambda t: growth_n(growth_x(hours_between(release_dt, t)),
+                                 k, nsat, x0)
+    # Coarse bins for the fit (rebuilt per distinct-read time below).
+    s_vals = [math.exp(math.log(0.02) + i * (math.log(0.999) - math.log(0.02)) / 12.0)
+              for i in range(13)]
+    h_vals = [math.exp(math.log(0.5) + i * (math.log(300.0) - math.log(0.5)) / 12.0)
+              for i in range(13)]
+    # Precompute per-read bin structures once (shared across (s, h)).
+    # With a single distinct read the error term is zero for every solvable
+    # (s, h) (a0 is solved to reproduce the one observed count), so the fit
+    # is just the prior penalty among solvable grid points — no inversion
+    # or convolution needed.
+    if len(distinct) == 1:
+        best = None
+        # The prior point itself is always a candidate: the log-spaced
+        # grid is coarse near s = 1, and with one read the data cannot move
+        # the fit, so the exact prior must be reachable.
+        for s, h in [(s0, h0)] + [(s, h) for s in s_vals for h in h_vals]:
+            if e0 > 0 and s <= e0 / max(n0, 1.0):
+                continue
+            if e0 > 0 and s * g_interp(AGES[-1], h) < e0 / max(n0, 1.0):
+                continue
+            pen = (((math.log(s) - math.log(s0)) / FIT_PRIOR_SIGMA) ** 2
+                   + ((math.log(h) - math.log(h0)) / FIT_PRIOR_SIGMA) ** 2)
+            if best is None or pen < best[0]:
+                best = (pen, s, h)
+        if best is None:
+            return s0, h0
+        return best[1], best[2]
+    read_bins = []
+    for (t, n, rates) in distinct:
+        read_bins.append(make_bins(t_first, t, n_curve, max_bins=30))
+    best = None
+    for s, h in [(s0, h0)] + [(s, h) for s in s_vals for h in h_vals]:
+        if e0 > 0 and s <= e0 / max(n0, 1.0):
+            continue
+        if e0 > 0:
+            a0 = invert_g(e0 / max(n0, 1.0) / s, h)
         else:
-            a_fit = num / den
-        # Prior penalty (in log space for a, log space for tau).
-        a_fit = min(0.999, max(0.001, a_fit))
+            a0 = 0.0
         err = 0.0
-        for (_, c_i), g in zip(obs, gs):
-            err += (a_fit * g - c_i) ** 2
-        # Scale the data error by the count magnitude so the penalty is
-        # comparable across trophies.
-        scale = max(1.0, sum(c for _, c in obs) / max(1, len(obs)))
-        err = err / (scale * scale)
-        pen = PRIOR_PENALTY * ((math.log(a_fit / a0)) ** 2 +
-                               (math.log(tau / tau0)) ** 2)
-        total = err + pen
-        if best is None or total < best[0]:
-            best = (total, a_fit, tau)
-    return (best[1], best[2])
+        for ri, (t, n, rates) in enumerate(distinct):
+            e_obs = rates[idx] / 100.0 * n if rates[idx] is not None else 0.0
+            e_pred = earned_at(t, s, h, a0, t_first, n0,
+                               read_bins[ri], n_curve)
+            err += ((e_pred - e_obs) ** 2) / max(1.0, e_obs)
+        pen = (((math.log(s) - math.log(s0)) / FIT_PRIOR_SIGMA) ** 2
+               + ((math.log(h) - math.log(h0)) / FIT_PRIOR_SIGMA) ** 2)
+        tot = err + pen
+        if best is None or tot < best[0]:
+            best = (tot, s, h)
+    if best is None:
+        return s0, h0
+    return best[1], best[2]
 
 
-def _count_per_unit_a(trophy_idx, case, reads, alpha, beta, tau,
-                      release_epoch, when_epoch):
-    """Predicted earned count at `when_epoch` per unit of eventual share
-    a (i.e. with a = 1), for the grid search. The cohort is anchored to
-    the first read's observed count, so the shape is set by tau."""
-    first = reads[0]
-    t0 = parse_time(first["at"])
-    n0 = first["players_tracked"]
-    rates0 = first["rates"]
-    r0 = rates0[trophy_idx] if rates0 and rates0[trophy_idx] is not None else 0.0
-    c_obs = r0 / 100.0 * n0
-    # With a = 1, eventual = n0. Cohort age at t0 for share c_obs / n0.
-    share0 = min(0.999999, max(0.0, c_obs / n0)) if n0 > 0 else 0.0
-    age0 = cohort_age_for_share(share0, tau)
-    age_w = age0 + max(0.0, (when_epoch - t0) / 86400.0)
-    c_cohort = n0 * earn_cdf(age_w, tau)
-    c_join = 0.0
-    h0 = max(0.0, (t0 - release_epoch) / 3600.0)
-    h1 = max(0.0, (when_epoch - release_epoch) / 3600.0)
-    if h1 > h0:
-        steps = max(1, int(math.ceil((h1 - h0) * 4)))
-        dh = (h1 - h0) / steps
-        total = 0.0
-        for i in range(steps + 1):
-            h = h0 + i * dh
-            age = max(0.0, (h1 - h) / 24.0)
-            f = earn_cdf(age, tau)
-            w = 0.5 if i in (0, steps) else 1.0
-            total += w * join_rate(alpha, beta, h) * f
-        c_join = total * dh
-    return c_cohort + c_join
+# ------------------------------------------------------- refresh model
+def sample_refresh_times(rng, staleness_h, horizon_h):
+    """Sample the refresh times (hours after the checkpoint) of the renewal
+    process up to the horizon. Returns the list of refresh offsets; an
+    empty list means no refresh before the target. The first interval is
+    the residual life given the page's age (staleness); later intervals
+    are fresh draws from the interval distribution."""
+    # Residual life: S(A + R) = U * S(A), solved by bisection.
+    s_a = lognorm_sf(staleness_h, REFRESH_MEAN_H, REFRESH_SIGMA)
+    u = rng.random()
+    target_sf = u * s_a
+    lo, hi = 0.0, 500.0
+    for _ in range(35):
+        mid = 0.5 * (lo + hi)
+        if lognorm_sf(staleness_h + mid, REFRESH_MEAN_H, REFRESH_SIGMA) > target_sf:
+            lo = mid
+        else:
+            hi = mid
+    r = 0.5 * (lo + hi)
+    times = []
+    t = r
+    while t <= horizon_h:
+        times.append(t)
+        # Fresh interval draw.
+        u2 = rng.random()
+        iv = lognorm_ppf(min(max(u2, 1e-9), 1 - 1e-9),
+                         REFRESH_MEAN_H, REFRESH_SIGMA)
+        t += max(iv, 0.05)
+    return times
 
 
+# ------------------------------------------------------- forecast a case
 def forecast_case(case):
-    """Forecast one case. Returns {"trophies": [{"id", "q": [...]}, ...]}."""
+    from datetime import timedelta
+    release_dt = parse_time(case["game"]["release_date"] + "T00:00:00Z")
+    checkpoint = parse_time(case["at"])
+    target = parse_time(case["target"])
+    horizon_h = hours_between(checkpoint, target)
     trophies = case["trophies"]
-    history = case.get("history") or []
-    if not history:
-        raise ValueError("case has no history")
-    release_epoch = parse_time(case["game"]["release_date"] + "T00:00:00Z")
-    target_epoch = parse_time(case["target"])
-    horizon_hours = case["horizon_minutes"] / 60.0
-    reads = distinct_reads(history)
-    alpha, beta, beta_sd, _ = fit_n(reads, release_epoch)
-    last = history[-1]
-    last_rates = last["rates"] or []
-    n_target = n_at(alpha, beta,
-                    max(0.0, (target_epoch - release_epoch) / 3600.0))
-    p_norefresh = math.exp(-horizon_hours / REFRESH_MEAN_HOURS)
-    rng = random.Random(BOOTSTRAP_SEED)
+    for i, tr in enumerate(trophies):
+        tr["_idx"] = i
+    history = case["history"]
+
+    # Distinct reads: consecutive identical (players, rates) collapse to
+    # one observation, kept at its first time.
+    distinct = []
+    prev_key = None
+    for rd in history:
+        key = (rd["players_tracked"], tuple(rd["rates"]))
+        if key != prev_key:
+            distinct.append((parse_time(rd["at"]), rd["players_tracked"],
+                             rd["rates"]))
+            prev_key = key
+    if not distinct:
+        # No history at all: fall back to a degenerate single read at the
+        # checkpoint (never exercised on real cases).
+        distinct = [(checkpoint, 1, [0.01] * len(trophies))]
+
+    t_first, n0, rates_first = distinct[0]
+    t_last_distinct = distinct[-1][0]
+    staleness_h = max(hours_between(t_last_distinct, checkpoint), 0.0)
+    last_rates = distinct[-1][2]
+
+    # Growth fit (point estimates) and per-trophy (s, h) fits.
+    k_pt, nsat_pt, x0_pt, growth_mode = fit_growth(distinct, release_dt)
+    growth_pt = (k_pt, nsat_pt, x0_pt)
+    fitted = []
+    for tr in trophies:
+        fitted.append(fit_trophy(tr, distinct, release_dt, growth_pt))
+
+    # Separate RNG streams (fixed seeds) so the draw order is unambiguous.
+    rng_g = random.Random(SEED)
+    rng_r = random.Random(SEED + 1)
+    rng_t = random.Random(SEED + 2)
+
+    k_sig = GROWTH_K_FIT_SIGMA if growth_mode == "fit" else GROWTH_K_SIGMA
+    nsat_sig = NSAT_FIT_SIGMA if growth_mode == "fit" else NSAT_SIGMA
+
+    draws = [[] for _ in trophies]  # draws[i] = list of rate draws
+    for _b in range(BOOTSTRAP_DRAWS):
+        # Growth draw.
+        k_b = math.exp(math.log(k_pt) + k_sig * norm_ppf(rng_g.random()))
+        nsat_b = math.exp(math.log(nsat_pt) + nsat_sig * norm_ppf(rng_g.random()))
+        nsat_b = max(nsat_b, max(d[1] for d in distinct) * 1.5)
+        x0_b = anchor_x0(growth_x(hours_between(release_dt, t_first)),
+                         n0, k_b, nsat_b)
+        n_curve_b = lambda t, _k=k_b, _n=nsat_b, _x=x0_b: growth_n(
+            growth_x(hours_between(release_dt, t)), _k, _n, _x)
+        # Refresh draw.
+        refresh_offsets = sample_refresh_times(rng_r, staleness_h, horizon_h)
+        if refresh_offsets:
+            t_last_refresh = checkpoint + timedelta(hours=refresh_offsets[-1])
+            bins_b = make_bins(t_first, t_last_refresh, n_curve_b)
+            n_at_refresh = n_curve_b(t_last_refresh)
+        else:
+            t_last_refresh = None
+            bins_b = []
+            n_at_refresh = None
+        # Trophy draws (id order: s first, then h, per trophy).
+        for i, tr in enumerate(trophies):
+            s_fit, h_fit = fitted[i]
+            s_b = math.exp(math.log(s_fit) + TROPHY_S_SIGMA * norm_ppf(rng_t.random()))
+            h_b = math.exp(math.log(h_fit) + TROPHY_H_SIGMA * norm_ppf(rng_t.random()))
+            s_b = min(max(s_b, 0.005), 0.999)
+            h_b = min(max(h_b, 0.1), 500.0)
+            if t_last_refresh is None:
+                # No refresh: the page still shows the last observed rates.
+                r = last_rates[i] if last_rates[i] is not None else 0.01
+                draws[i].append(float(r))
+                continue
+            e0 = rates_first[i] / 100.0 * n0 if rates_first[i] is not None else 0.0
+            if e0 > 0 and s_b > e0 / max(n0, 1.0):
+                a0_b = invert_g(e0 / max(n0, 1.0) / s_b, h_b)
+            else:
+                a0_b = 0.0
+            e_b = earned_at(t_last_refresh, s_b, h_b, a0_b, t_first, n0,
+                            bins_b, n_curve_b)
+            rate_b = 100.0 * e_b / max(n_at_refresh, 1.0)
+            draws[i].append(rate_b)
+
     rows = []
-    for idx, trophy in enumerate(trophies):
-        r_last = last_rates[idx] if idx < len(last_rates) and last_rates[idx] is not None else 0.0
-        a, tau = fit_trophy(idx, case, reads, alpha, beta, release_epoch)
-        # Point forecast (median of the model, before the bootstrap).
-        c_pt = predict_count(idx, case, reads, alpha, beta, a, tau,
-                             release_epoch, target_epoch)
-        rate_pt = 100.0 * c_pt / n_target if n_target > 0 else r_last
-        # Bootstrap: 80 draws.
-        draws = []
-        for _ in range(BOOTSTRAP_DRAWS):
-            # Resample the N slope (wide when unidentified) and (a, tau).
-            b_s = rng.gauss(beta, beta_sd)
-            a_s = a * math.exp(rng.gauss(0.0, 0.20))
-            a_s = min(0.999, max(0.001, a_s))
-            tau_s = tau * math.exp(rng.gauss(0.0, 0.20))
-            n_s = n_at(alpha, b_s,
-                       max(0.0, (target_epoch - release_epoch) / 3600.0))
-            c_s = predict_count(idx, case, reads, alpha, b_s, a_s, tau_s,
-                                release_epoch, target_epoch)
-            rate_s = 100.0 * c_s / n_s if n_s > 0 else r_last
-            # Small floor spread on the logit scale.
-            lg = logit(rate_s) + rng.gauss(0.0, FLOOR_SPREAD)
-            rate_s = inv_logit(lg)
-            # No-refresh branch: with probability p the answer read shows
-            # exactly the last observed rates.
-            if rng.random() < p_norefresh:
-                rate_s = r_last
-            draws.append(rate_s)
-        draws.sort()
+    for i, tr in enumerate(trophies):
+        if last_rates[i] is not None and last_rates[i] >= SATURATED_MIN_RATE:
+            rows.append({"id": tr["id"], "q": list(SATURATED_Q)})
+            continue
+        ds = sorted(draws[i])
+        n = len(ds)
         qs = []
-        for level in LEVELS:
-            j = min(int(level * BOOTSTRAP_DRAWS), BOOTSTRAP_DRAWS - 1)
-            qs.append(round4(clamp(draws[j])))
-        rows.append({"id": trophy["id"], "q": qs})
+        for tau in (0.05, 0.25, 0.5, 0.75, 0.95):
+            pos = tau * (n - 1)
+            lo_i = int(math.floor(pos))
+            hi_i = min(lo_i + 1, n - 1)
+            frac = pos - lo_i
+            qs.append(ds[lo_i] * (1 - frac) + ds[hi_i] * frac)
+        # Small logit floor spread so no band is degenerate.
+        # (logit takes a fraction, so the percent rate is divided by 100.)
+        out = []
+        for q, z in zip(qs, Z_TAU):
+            out.append(clamp_rate(100.0 * inv_logit(logit(q / 100.0) + z * FLOOR_SD)))
+        # Enforce non-decreasing.
+        for j in range(1, 5):
+            if out[j] < out[j - 1]:
+                out[j] = out[j - 1]
+        rows.append({"id": tr["id"],
+                     "q": [round(v, 4) for v in out]})
     return {"trophies": rows}
 
 
-def main() -> None:
-    OUTPUT_DIR.mkdir(parents=True, exist_ok=True)
-    for path in sorted(INPUT_DIR.glob("*.in")):
-        case = json.loads(path.read_text(encoding="utf-8"))
-        forecast = forecast_case(case)
-        (OUTPUT_DIR / f"{path.stem}.out").write_text(
-            json.dumps(forecast, separators=(",", ":")) + "\n",
-            encoding="utf-8")
+def main():
+    in_dir = os.environ.get("MAKEFUN_INPUT_DIR", "/input")
+    out_dir = os.environ.get("MAKEFUN_OUTPUT_DIR", "/output")
+    os.makedirs(out_dir, exist_ok=True)
+    names = sorted(f for f in os.listdir(in_dir) if f.endswith(".in"))
+    for name in names:
+        with open(os.path.join(in_dir, name), "r", encoding="utf-8") as fh:
+            case = json.load(fh)
+        fc = forecast_case(case)
+        out_path = os.path.join(out_dir, case["id"] + ".out")
+        with open(out_path, "w", encoding="utf-8") as fh:
+            json.dump(fc, fh, separators=(",", ":"))
+            fh.write("\n")
+    return 0
 
 
 if __name__ == "__main__":
-    main()
+    sys.exit(main())
